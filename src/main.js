@@ -4,6 +4,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { Line2 } from "three/addons/lines/Line2.js";
 import { LineGeometry } from "three/addons/lines/LineGeometry.js";
 import { LineMaterial } from "three/addons/lines/LineMaterial.js";
+import { createCardRewardSystem } from "./card-reward.js";
 
 const app = document.querySelector("#app");
 const loaderStatus = document.querySelector("#loader-status");
@@ -20,6 +21,9 @@ const bridgeMessage = document.querySelector("#bridge-message");
 const vrHandHud = document.querySelector("#vr-hand-hud");
 const vrLeftStatus = document.querySelector("#vr-left-status");
 const vrRightStatus = document.querySelector("#vr-right-status");
+const fountainStars = document.querySelector("#fountain-stars");
+const fountainStarElements = Array.from(document.querySelectorAll(".fountain-star"));
+const cardBackpack = document.querySelector("#card-backpack");
 const bridgeDebugMode = new URLSearchParams(window.location.search).has("bridge-debug");
 const roamDebugMode = new URLSearchParams(window.location.search).has("roam-debug");
 const animalPreviewMode = new URLSearchParams(window.location.search).has("animals-preview");
@@ -37,14 +41,19 @@ const renderer = new THREE.WebGLRenderer({
   powerPreference: "high-performance",
 });
 renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+const recordingFriendlyPixelRatio = Math.min(window.devicePixelRatio, 1);
+renderer.setPixelRatio(recordingFriendlyPixelRatio);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.12;
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.shadowMap.autoUpdate = false;
+renderer.shadowMap.needsUpdate = true;
 app.appendChild(renderer.domElement);
 renderer.domElement.tabIndex = 0;
+document.body.dataset.renderPixelRatio = recordingFriendlyPixelRatio.toFixed(2);
+document.body.dataset.shadowUpdateMode = "on-demand";
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
@@ -88,6 +97,9 @@ function getFramePerformance() {
 }
 const keys = new Set();
 const pressedPadKeys = new Set();
+function keyIsActive(code) {
+  return keys.has(code) || pressedPadKeys.has(code);
+}
 const pointerState = {
   active: false,
   id: null,
@@ -110,6 +122,9 @@ const player = {
   maxDropHeight: 0.58,
   verticalFollow: 13,
 };
+const playerForward = new THREE.Vector3();
+const playerRight = new THREE.Vector3();
+const playerIntent = new THREE.Vector3();
 
 const overviewCameraPreset = {
   position: new THREE.Vector3(4.1, 3.15, -7.35),
@@ -162,6 +177,12 @@ const fountainFx = {
   missing: [],
 };
 
+const fountainStarProgress = {
+  active: false,
+  dismissed: false,
+  litCount: 0,
+};
+
 const fountainFocusPreset = {
   position: new THREE.Vector3(3.05, 3.0, -1.82),
   target: new THREE.Vector3(3.18, 0.56, 3.72),
@@ -205,6 +226,10 @@ const bridgePuzzle = {
   debugAutoSequence: false,
   missing: [],
 };
+const bridgeFloatRotation = new THREE.Quaternion();
+const bridgeRejectRotation = new THREE.Quaternion();
+const bridgeUpAxis = new THREE.Vector3(0, 1, 0);
+const bridgeForwardAxis = new THREE.Vector3(0, 0, 1);
 
 const vrInteraction = {
   ready: false,
@@ -219,6 +244,8 @@ const vrInteraction = {
   aimCandidatePoint: new THREE.Vector3(),
   aimHitPoint: new THREE.Vector3(),
   activeHandId: "",
+  rayUpdateElapsed: 0,
+  rayUpdateInterval: 1 / 30,
 };
 
 const groundCollision = {
@@ -253,6 +280,11 @@ const roamBridgeTest = {
 
 scene.add(camera);
 scene.add(modelRoot);
+const cardReward = createCardRewardSystem({
+  camera,
+  backpackElement: cardBackpack,
+});
+window.__CARD_REWARD_STATE__ = () => cardReward.getState();
 
 function setupLighting() {
   scene.add(new THREE.HemisphereLight(0xe9fcff, 0xe59f63, 2.25));
@@ -260,7 +292,7 @@ function setupLighting() {
   const sun = new THREE.DirectionalLight(0xffefd1, 3.6);
   sun.position.set(-4.5, 8, 5.5);
   sun.castShadow = true;
-  sun.shadow.mapSize.set(2048, 2048);
+  sun.shadow.mapSize.set(1024, 1024);
   sun.shadow.camera.left = -9;
   sun.shadow.camera.right = 9;
   sun.shadow.camera.top = 7;
@@ -272,6 +304,10 @@ function setupLighting() {
   const fill = new THREE.DirectionalLight(0x78e4ff, 0.9);
   fill.position.set(5, 3, -4);
   scene.add(fill);
+}
+
+function requestShadowRefresh() {
+  renderer.shadowMap.needsUpdate = true;
 }
 
 const vrHandTextureLoader = new THREE.TextureLoader();
@@ -306,7 +342,9 @@ function createVrHand(id, side, button, color, pointerX) {
   const sideSign = side === "left" ? -1 : 1;
   const group = new THREE.Group();
   group.name = `VR_${id.toUpperCase()}_HAND`;
-  group.position.set(sideSign * 0.31, -0.2, -0.75);
+  const basePosition = new THREE.Vector3(sideSign * 0.31, -0.2, -0.75);
+  const cardPosition = new THREE.Vector3(sideSign * 0.47, -0.27, -0.67);
+  group.position.copy(basePosition);
   camera.add(group);
 
   const handGeometry = new THREE.PlaneGeometry(0.33, 0.5);
@@ -322,7 +360,7 @@ function createVrHand(id, side, button, color, pointerX) {
   const gripHand = new THREE.Mesh(handGeometry, gripMaterial);
   [openHand, gripHand].forEach((handPlane, index) => {
     handPlane.name = `VR_${id.toUpperCase()}_${index === 0 ? "OPEN" : "GRIP"}_TEXTURE`;
-    handPlane.renderOrder = 40;
+    handPlane.renderOrder = 96;
     handPlane.frustumCulled = false;
     group.add(handPlane);
   });
@@ -352,7 +390,7 @@ function createVrHand(id, side, button, color, pointerX) {
   rayMaterial.resolution.set(window.innerWidth, window.innerHeight);
   const rayLine = new Line2(rayGeometry, rayMaterial);
   rayLine.name = `VR_${id.toUpperCase()}_RAY`;
-  rayLine.renderOrder = 39;
+  rayLine.renderOrder = 95;
   rayLine.frustumCulled = false;
   scene.add(rayLine);
 
@@ -362,6 +400,8 @@ function createVrHand(id, side, button, color, pointerX) {
     button,
     color,
     group,
+    basePosition,
+    cardPosition,
     openHand,
     gripHand,
     openMaterial,
@@ -490,6 +530,14 @@ function findVrAimHit(hand) {
     }
   }
 
+  const rewardHit = cardReward.findHit(hand.raycaster);
+  if (rewardHit && rewardHit.distance < bestDistance) {
+    bestType = "reward-card";
+    bestPiece = rewardHit.piece;
+    bestDistance = rewardHit.distance;
+    vrInteraction.aimHitPoint.copy(rewardHit.point);
+  }
+
   return bestType
     ? {
         type: bestType,
@@ -500,9 +548,9 @@ function findVrAimHit(hand) {
     : null;
 }
 
-function updateVrHandRay(hand) {
+function updateVrHandRay(hand, matrixWorldReady = false) {
   if (!hand || mode !== "roam") return;
-  scene.updateMatrixWorld(true);
+  if (!matrixWorldReady) scene.updateMatrixWorld(true);
   hand.raySource.getWorldPosition(vrInteraction.raySource);
   hand.raycaster.setFromCamera(hand.pointer, camera);
   hand.raycaster.near = 0;
@@ -512,7 +560,9 @@ function updateVrHandRay(hand) {
   hand.hoveredPiece = null;
   hand.hitType = null;
 
-  if (hit?.type === "fountain") {
+  if (hit?.type === "reward-card") {
+    hand.hitType = "reward-card";
+  } else if (hit?.type === "fountain") {
     hand.hitType = "fountain";
   } else if (hit?.type === "bridge" && isVrBridgePieceAvailable(hit.piece)) {
     hand.hitType = "bridge";
@@ -531,7 +581,9 @@ function updateVrHandRay(hand) {
   ]);
   const rayColor = hand.heldPiece
     ? 0x83f0bd
-    : hand.hitType === "fountain"
+    : hand.hitType === "reward-card"
+      ? 0xffd35c
+      : hand.hitType === "fountain"
       ? 0x6ee9ff
       : hand.hoveredPiece
         ? 0xffd35c
@@ -550,10 +602,12 @@ function updateVrHighlights() {
     if (!group.representative || group.heldByHand) return;
     setBridgePieceHighlight(group.representative, highlighted.has(group.representative));
   });
+  cardReward.setHovered(vrInteraction.hands.some((hand) => hand.hitType === "reward-card"));
 }
 
 function getVrHandStatus(hand) {
   if (hand.heldPiece) return ["held", `持有${hand.heldPiece.userData.bridgeGroup?.label || "积木"} · 再点归桥`];
+  if (hand.hitType === "reward-card") return ["reward-card", "Card01"];
   if (hand.hitType === "fountain") {
     const next = fountainSegments[fountainFx.nextSegmentIndex]?.label || "重新唤醒";
     return ["fountain", `泉水 · 点击${next}`];
@@ -571,9 +625,11 @@ function updateVrHandHud(hand) {
   if (hand.statusText) hand.statusText.textContent = text;
   document.body.dataset[`${handDatasetPrefix}State`] = state;
   document.body.dataset[`${handDatasetPrefix}Target`] =
-    hand.hitType === "fountain"
-      ? "fountain"
-      : hand.hoveredPiece?.userData.bridgeGroup?.label || "";
+    hand.hitType === "reward-card"
+      ? "Card01"
+      : hand.hitType === "fountain"
+        ? "fountain"
+        : hand.hoveredPiece?.userData.bridgeGroup?.label || "";
   document.body.dataset[`${handDatasetPrefix}RayColor`] = `#${hand.rayMaterial.color.getHexString()}`;
   document.body.dataset[`${handDatasetPrefix}IdleRayColor`] = idleRayColor;
 }
@@ -581,7 +637,20 @@ function updateVrHandHud(hand) {
 function updateVrHands(delta) {
   if (!vrInteraction.ready) return;
   const visible = mode === "roam";
+  vrInteraction.rayUpdateElapsed += delta;
+  const shouldRefreshAim = visible && vrInteraction.rayUpdateElapsed >= vrInteraction.rayUpdateInterval;
+  if (shouldRefreshAim) {
+    vrInteraction.rayUpdateElapsed %= vrInteraction.rayUpdateInterval;
+    scene.updateMatrixWorld(true);
+  }
+  const cardState = cardReward.getState();
+  const cardPresentationActive =
+    cardState.triggered && !cardState.collected && cardState.phase !== "idle";
   vrInteraction.hands.forEach((hand) => {
+    const handTargetPosition = cardPresentationActive ? hand.cardPosition : hand.basePosition;
+    hand.group.position.x = THREE.MathUtils.damp(hand.group.position.x, handTargetPosition.x, 12, delta);
+    hand.group.position.y = THREE.MathUtils.damp(hand.group.position.y, handTargetPosition.y, 12, delta);
+    hand.group.position.z = THREE.MathUtils.damp(hand.group.position.z, handTargetPosition.z, 12, delta);
     const gripTarget = hand.pressed || hand.heldPiece ? 1 : 0;
     hand.grip = THREE.MathUtils.damp(hand.grip, gripTarget, 18, delta);
     const gripOpacity = (hand.heldPiece ? 0.56 : 0.7) * hand.grip;
@@ -591,12 +660,14 @@ function updateVrHands(delta) {
     hand.gripHand.visible = visible && hand.gripMaterial.opacity > 0.015;
     hand.group.visible = visible;
     hand.rayLine.visible = visible;
-    if (visible) updateVrHandRay(hand);
-    updateVrHandHud(hand);
+    if (shouldRefreshAim) updateVrHandRay(hand, true);
+    if (shouldRefreshAim || !visible) updateVrHandHud(hand);
   });
-  if (visible) updateVrHighlights();
-  document.body.dataset.vrActiveHand = vrInteraction.activeHandId;
-  document.body.dataset.vrViewFollowsRay = "true";
+  if (shouldRefreshAim) {
+    updateVrHighlights();
+    document.body.dataset.vrActiveHand = vrInteraction.activeHandId;
+    document.body.dataset.vrViewFollowsRay = "true";
+  }
 }
 
 function getVrHandDebugState() {
@@ -730,6 +801,44 @@ function syncFountainSegmentDataset() {
   document.body.dataset.fountainAwaitingInput = String(
     fountainFx.ready && !fountainFx.playing && !fountainFx.complete,
   );
+}
+
+function syncFountainStarProgress() {
+  const visible =
+    mode === "roam" && fountainStarProgress.active && !fountainStarProgress.dismissed;
+  fountainStars?.classList.toggle("is-visible", visible);
+  fountainStars?.setAttribute("aria-hidden", String(!visible));
+  fountainStarElements.forEach((star, index) => {
+    star.classList.toggle("is-lit", index < fountainStarProgress.litCount);
+  });
+  document.body.dataset.fountainStarsVisible = String(visible);
+  document.body.dataset.fountainStarsLit = String(fountainStarProgress.litCount);
+  document.body.dataset.fountainStarsDismissed = String(fountainStarProgress.dismissed);
+}
+
+function registerRoamFountainClick(segmentIndex) {
+  if (mode !== "roam") return;
+  if (segmentIndex === 0) {
+    fountainStarProgress.active = true;
+    fountainStarProgress.dismissed = false;
+    fountainStarProgress.litCount = 0;
+  } else if (!fountainStarProgress.dismissed) {
+    fountainStarProgress.active = true;
+    fountainStarProgress.litCount = Math.min(fountainStarElements.length, segmentIndex);
+  }
+  syncFountainStarProgress();
+}
+
+function dismissFountainStarsOnStairs() {
+  if (
+    fountainStarProgress.active &&
+    !fountainStarProgress.dismissed &&
+    player.groundName.includes("stair_terrace")
+  ) {
+    fountainStarProgress.active = false;
+    fountainStarProgress.dismissed = true;
+    syncFountainStarProgress();
+  }
 }
 
 function resetFountainVisuals() {
@@ -931,6 +1040,7 @@ function startFountainAnimation() {
   const segmentIndex = fountainFx.nextSegmentIndex;
   const segment = fountainSegments[segmentIndex];
   if (!segment) return;
+  registerRoamFountainClick(segmentIndex);
   if (segmentIndex === 0) {
     fountainFx.elapsed = 0;
     resetFountainVisuals();
@@ -970,6 +1080,7 @@ function completeFountainSegment() {
     fountainFx.complete = false;
     setFountainButtonState("ready", getFountainSegmentButtonLabel(fountainFx.nextSegmentIndex));
   }
+  requestShadowRefresh();
   syncFountainSegmentDataset();
 }
 
@@ -1390,6 +1501,7 @@ function completeBridgePiece(animation) {
   bridgePuzzle.nextSequenceIndex = Math.min(bridgePuzzle.nextSequenceIndex + 1, bridgeSelectionSequence.length);
   bridgePuzzle.assembledCount = bridgePuzzle.groups.filter((item) => item.assembled).length;
   bridgePuzzle.complete = bridgePuzzle.assembledCount === bridgePuzzle.groups.length;
+  requestShadowRefresh();
 
   if (bridgePuzzle.complete) {
     bridgePuzzle.debugAutoSequence = false;
@@ -1425,10 +1537,6 @@ function updateBridgePuzzle(delta, time) {
     }
   }
 
-  const floatRotation = new THREE.Quaternion();
-  const rejectRotation = new THREE.Quaternion();
-  const up = new THREE.Vector3(0, 1, 0);
-  const forward = new THREE.Vector3(0, 0, 1);
   bridgePuzzle.groups.forEach((group) => {
     if (!group.rejecting) return;
     const piece = group.representative;
@@ -1440,8 +1548,8 @@ function updateBridgePuzzle(delta, time) {
     const wave = Math.sin(raw * Math.PI * 10);
     piece.position.copy(piece.userData.bridgeRejectPosition);
     piece.position.x += wave * piece.userData.bridgeRejectAmplitude * decay;
-    rejectRotation.setFromAxisAngle(forward, wave * 0.065 * decay);
-    piece.quaternion.copy(piece.userData.bridgeRejectQuaternion).multiply(rejectRotation);
+    bridgeRejectRotation.setFromAxisAngle(bridgeForwardAxis, wave * 0.065 * decay);
+    piece.quaternion.copy(piece.userData.bridgeRejectQuaternion).multiply(bridgeRejectRotation);
     const outline = piece.userData.bridgeErrorOutline;
     if (outline) outline.material.opacity = 0.25 + Math.abs(Math.sin(raw * Math.PI * 7)) * 0.75;
     if (raw >= 1) finishBridgeRejection(group);
@@ -1453,8 +1561,8 @@ function updateBridgePuzzle(delta, time) {
     const phase = time * 1.35 + piece.userData.bridgeFloatPhase;
     piece.position.copy(piece.userData.bridgeStartPosition);
     piece.position.y += Math.sin(phase) * piece.userData.bridgeBobAmplitude;
-    floatRotation.setFromAxisAngle(up, Math.sin(phase * 0.72) * 0.045);
-    piece.quaternion.copy(piece.userData.bridgeStartQuaternion).multiply(floatRotation);
+    bridgeFloatRotation.setFromAxisAngle(bridgeUpAxis, Math.sin(phase * 0.72) * 0.045);
+    piece.quaternion.copy(piece.userData.bridgeStartQuaternion).multiply(bridgeFloatRotation);
   });
 
   if (vrInteraction.ready || mode !== "roam") setHoveredBridgePiece(null);
@@ -1572,6 +1680,10 @@ function handleVrHandAction(hand) {
   if (!hand || mode !== "roam") return false;
   updateVrHandRay(hand);
   if (hand.heldPiece) return releaseVrHeldPieceToBridge(hand);
+
+  if (hand.hitType === "reward-card") {
+    return cardReward.collect();
+  }
 
   if (hand.hitType === "fountain") {
     startFountainAnimation();
@@ -2160,6 +2272,7 @@ function loadModel() {
       });
 
       modelRoot.add(model);
+      requestShadowRefresh();
       prepareFountainAnimation(model);
       prepareVrFountainTarget(model);
       prepareBridgePuzzle(model);
@@ -2169,6 +2282,7 @@ function loadModel() {
       } catch (error) {
         console.error("Failed to replace Sky Island animals with low FBX assets", error);
       }
+      requestShadowRefresh();
       modelBounds = new THREE.Box3().setFromObject(modelRoot);
       modelLoaded = true;
       publishGroundSurfaceDebug();
@@ -2221,6 +2335,8 @@ function setMode(nextMode, shouldLock = false) {
   controls.enabled = mode === "browse";
   movePad.hidden = mode !== "roam";
   setVrHandsVisible(mode === "roam");
+  cardReward.setMode(mode);
+  syncFountainStarProgress();
   renderer.domElement.focus();
 
   if (mode === "browse") {
@@ -2276,24 +2392,36 @@ function tryMovePlayerTo(x, z) {
   return true;
 }
 
+function updateCardRewardTrigger() {
+  const rewardState = cardReward.getState();
+  if (
+    mode === "roam" &&
+    bridgePuzzle.complete &&
+    !rewardState.triggered &&
+    !rewardState.collected &&
+    player.position.x <= 6.45 &&
+    player.groundName.includes("Main_playable_floating_island")
+  ) {
+    cardReward.trigger();
+  }
+}
+
 function updatePlayer(delta) {
   if (mode !== "roam") return;
 
   if (!updateRoamBridgeTest(delta) && !updateRoamStairTest(delta)) {
-    const forward = new THREE.Vector3(-Math.sin(player.yaw), 0, -Math.cos(player.yaw));
-    const right = new THREE.Vector3(Math.cos(player.yaw), 0, -Math.sin(player.yaw));
-    const intent = new THREE.Vector3();
-    const activeKeys = new Set([...keys, ...pressedPadKeys]);
+    playerForward.set(-Math.sin(player.yaw), 0, -Math.cos(player.yaw));
+    playerRight.set(Math.cos(player.yaw), 0, -Math.sin(player.yaw));
+    playerIntent.set(0, 0, 0);
+    if (keyIsActive("KeyW") || keyIsActive("ArrowUp")) playerIntent.add(playerForward);
+    if (keyIsActive("KeyS") || keyIsActive("ArrowDown")) playerIntent.sub(playerForward);
+    if (keyIsActive("KeyA") || keyIsActive("ArrowLeft")) playerIntent.sub(playerRight);
+    if (keyIsActive("KeyD") || keyIsActive("ArrowRight")) playerIntent.add(playerRight);
 
-    if (activeKeys.has("KeyW") || activeKeys.has("ArrowUp")) intent.add(forward);
-    if (activeKeys.has("KeyS") || activeKeys.has("ArrowDown")) intent.sub(forward);
-    if (activeKeys.has("KeyA") || activeKeys.has("ArrowLeft")) intent.sub(right);
-    if (activeKeys.has("KeyD") || activeKeys.has("ArrowRight")) intent.add(right);
-
-    if (intent.lengthSq() > 0) {
-      intent.normalize().multiplyScalar(player.speed * delta);
-      const nextX = player.position.x + intent.x;
-      const nextZ = player.position.z + intent.z;
+    if (playerIntent.lengthSq() > 0) {
+      playerIntent.normalize().multiplyScalar(player.speed * delta);
+      const nextX = player.position.x + playerIntent.x;
+      const nextZ = player.position.z + playerIntent.z;
       if (!tryMovePlayerTo(nextX, nextZ)) {
         if (!tryMovePlayerTo(nextX, player.position.z)) {
           tryMovePlayerTo(player.position.x, nextZ);
@@ -2333,6 +2461,8 @@ function updatePlayer(delta) {
     roamStairTest.status = "complete";
     publishRoamStairTest();
   }
+  dismissFountainStarsOnStairs();
+  updateCardRewardTrigger();
   applyPlayerCamera();
 }
 
@@ -2351,6 +2481,7 @@ function animate() {
   updatePlayer(movementDelta);
   updateFountainAnimation(animationDelta, introDrift);
   updateBridgePuzzle(animationDelta, introDrift);
+  cardReward.update(animationDelta, introDrift);
 
   if (mode === "browse") {
     controls.update();
@@ -2395,6 +2526,7 @@ function getDebugState() {
     performance: getFramePerformance(),
     fountain: getFountainDebugState(),
     bridge: getBridgeDebugState(),
+    cardReward: cardReward.getState(),
     roam: getRoamDebugState(),
     vrHands: getVrHandDebugState(),
   };
@@ -2408,6 +2540,11 @@ window.addEventListener("keydown", (event) => {
     event.preventDefault();
     const nextMode = mode === "browse" ? "roam" : "browse";
     setMode(nextMode, nextMode === "roam");
+    return;
+  }
+  if (!event.repeat && event.code === "KeyX") {
+    event.preventDefault();
+    cardReward.toggleBackpack();
     return;
   }
   if (!event.repeat && event.code === "KeyF") {
@@ -2424,6 +2561,21 @@ window.addEventListener("keydown", (event) => {
   if (bridgeDebugMode && mode === "roam" && !event.repeat && event.code === "KeyB") {
     event.preventDefault();
     startBridgeDebugSequence();
+    return;
+  }
+  if (bridgeDebugMode && mode === "roam" && !event.repeat && event.code === "KeyC") {
+    event.preventDefault();
+    cardReward.trigger();
+    return;
+  }
+  if (bridgeDebugMode && mode === "roam" && !event.repeat && event.code === "KeyV") {
+    event.preventDefault();
+    startRoamBridgeTest();
+    return;
+  }
+  if (roamDebugMode && mode === "roam" && !event.repeat && event.code === "KeyT") {
+    event.preventDefault();
+    startRoamStairTest();
     return;
   }
   if (event.code === "Escape" && mode === "roam") {
